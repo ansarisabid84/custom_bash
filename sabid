@@ -1,0 +1,246 @@
+#!/bin/bash
+
+# Configuration
+CSV_DIR="$HOME/.ssh/quickssh"
+CSV_FILE="$CSV_DIR/servers.csv"
+
+# Initialize environment
+mkdir -p "$CSV_DIR"
+touch "$CSV_FILE"
+chmod 700 "$CSV_DIR"
+chmod 600 "$CSV_FILE"
+
+# Create CSV headers if empty
+[ ! -s "$CSV_FILE" ] && echo "alias_name,server_username,server_ip,password,port" > "$CSV_FILE"
+
+function show_help {
+    echo "Usage:"
+    echo "  sabid ssh list [-a]              - List aliases (-a shows passwords)"
+    echo "  sabid ssh list <alias>          - Show alias details"
+    echo "  sabid ssh <alias|hostname|ip>   - Connect to server"
+    echo "  sabid ssh add <alias> <user> <host> <pass> [port] - Add/update server"
+    echo "  sabid ssh remove <alias>        - Remove server"
+    echo "  sabid ssh help                  - Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  sabid ssh add dashboard root dashboard.talentsprint.com 'password'"
+    echo "  sabid ssh dashboard.talentsprint.com"
+    echo "  sabid ssh 212.71.253.143"
+    echo "  sabid ssh dashboard"
+}
+
+function list_aliases {
+    if [ "$1" = "-a" ]; then
+        echo -e "\n\033[1mAvailable aliases (with passwords):\033[0m\n"
+        awk -F',' 'NR > 1 {
+            port = ($5 == "") ? "22" : $5;
+            printf "  \033[36m%-15s\033[0m\t→\t\033[33m%s@%s:%s\033[0m\t[\033[31m%s\033[0m]\n", $1, $2, $3, port, $4
+        }' "$CSV_FILE"
+    elif [ -z "$1" ]; then
+        echo -e "\n\033[1mAvailable aliases:\033[0m\n"
+        awk -F',' 'NR > 1 {
+            port = ($5 == "") ? "22" : $5;
+            printf "  \033[36m%-15s\033[0m\t→\t\033[33m%s@%s:%s\033[0m\n", $1, $2, $3, port
+        }' "$CSV_FILE"
+    else
+        ENTRY=$(grep "^$1," "$CSV_FILE")
+        if [ -z "$ENTRY" ]; then
+            echo -e "\033[31mAlias '$1' not found.\033[0m"
+            exit 1
+        fi
+        IFS=',' read -r alias user host pass port <<< "$ENTRY"
+        [ -z "$port" ] && port=22
+        echo -e "\n\033[1mServer Details:\033[0m"
+        echo -e "  \033[36mAlias:\033[0m\t$alias"
+        echo -e "  \033[36mUser:\033[0m\t\t$user"
+        echo -e "  \033[36mHost:\033[0m\t\t$host"
+        echo -e "  \033[36mPort:\033[0m\t\t$port"
+        echo -e "  \033[36mPassword:\033[0m\t$pass\n"
+    fi
+}
+
+function add_alias {
+    if [[ -z "$1" || -z "$2" || -z "$3" || -z "$4" ]]; then
+        echo "Usage: sabid ssh add <alias> <user> <host> <pass> [port]"
+        exit 1
+    fi
+
+    local alias="$1"
+    local user="$2"
+    local host="$3"
+    local pass="$4"
+    local port="${5:-22}"
+
+    # Create primary record with original alias
+    add_single_record "$alias" "$user" "$host" "$pass" "$port"
+
+    # Create secondary record
+    if [[ $host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        # If host is IP, use IP as secondary alias
+        add_single_record "$host" "$user" "$host" "$pass" "$port"
+        echo "Added records:"
+        echo "  - $alias → $user@$host:$port"
+        echo "  - $host → $user@$host:$port"
+    else
+        # If host is hostname, use resolved IP as secondary alias
+        ip=$(dig +short "$host" | head -1)
+        if [ -n "$ip" ]; then
+            add_single_record "$ip" "$user" "$host" "$pass" "$port"
+            echo "Added records:"
+            echo "  - $alias → $user@$host:$port"
+            echo "  - $ip → $user@$host:$port"
+        else
+            echo "Added record:"
+            echo "  - $alias → $user@$host:$port"
+            echo "Warning: Could not resolve IP for $host"
+        fi
+    fi
+}
+
+function add_single_record {
+    local alias="$1"
+    local user="$2"
+    local host="$3"
+    local pass="$4"
+    local port="$5"
+
+    TMP=$(mktemp)
+    grep -v "^$alias," "$CSV_FILE" > "$TMP"
+    printf '%s,%s,%s,%s,%s\n' "$alias" "$user" "$host" "$pass" "$port" >> "$TMP"
+    mv "$TMP" "$CSV_FILE"
+    chmod 600 "$CSV_FILE"
+}
+
+function remove_alias {
+    if [ -z "$1" ]; then
+        echo "Usage: sabid ssh remove <alias>"
+        exit 1
+    fi
+
+    # Find the host associated with this alias
+    ENTRY=$(grep "^$1," "$CSV_FILE")
+    if [ -z "$ENTRY" ]; then
+        echo "Alias '$1' not found."
+        exit 1
+    fi
+
+    IFS=',' read -r alias user host pass port <<< "$ENTRY"
+    
+    # Remove both the alias and its secondary record
+    TMP=$(mktemp)
+    grep -v "^$1," "$CSV_FILE" > "$TMP"
+    
+    # Remove IP record if exists
+    if [[ $host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        # Remove record with IP as alias
+        grep -v "^$host," "$TMP" > "${TMP}.2" && mv "${TMP}.2" "$TMP"
+    else
+        # Remove record with resolved IP as alias
+        ip=$(dig +short "$host" | head -1)
+        [ -n "$ip" ] && grep -v "^$ip," "$TMP" > "${TMP}.2" && mv "${TMP}.2" "$TMP"
+    fi
+    
+    mv "$TMP" "$CSV_FILE"
+    chmod 600 "$CSV_FILE"
+    echo "Removed alias '$1' and related records"
+}
+
+function connect_ssh {
+    # Check if argument is an existing alias
+    ENTRY=$(grep "^$1," "$CSV_FILE")
+    
+    if [ -z "$ENTRY" ]; then
+        # If not a direct alias, try resolving hostname to IP
+        if [[ ! "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            resolved_host=$(dig +short "$1" | head -1)
+            
+            # If we got a CNAME (non-IP result), resolve it further
+            if [ -n "$resolved_host" ] && [[ ! "$resolved_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                resolved_ip=$(dig +short "$resolved_host" | head -1)
+                if [ -n "$resolved_ip" ]; then
+                    # Check if resolved IP exists as an alias
+                    ENTRY=$(grep "^$resolved_ip," "$CSV_FILE")
+                    if [ -z "$ENTRY" ]; then
+                        echo -e "\033[31mNo alias found for '$1' or its resolved host ($resolved_host → $resolved_ip)\033[0m"
+                        exit 1
+                    fi
+                else
+                    echo -e "\033[31mNo alias found for '$1' or its resolved host ($resolved_host)\033[0m"
+                    exit 1
+                fi
+            elif [ -n "$resolved_host" ]; then
+                # We got an IP directly
+                ENTRY=$(grep "^$resolved_host," "$CSV_FILE")
+                if [ -z "$ENTRY" ]; then
+                    echo -e "\033[31mNo alias found for '$1' or its IP ($resolved_host)\033[0m"
+                    exit 1
+                fi
+            else
+                echo -e "\033[31mCould not resolve '$1' to any IP address\033[0m"
+                exit 1
+            fi
+        else
+            # Check if IP exists as an alias
+            ENTRY=$(grep "^$1," "$CSV_FILE")
+            if [ -z "$ENTRY" ]; then
+                echo -e "\033[31mNo alias found for '$1'\033[0m"
+                exit 1
+            fi
+        fi
+    fi
+
+    IFS=',' read -r alias user host pass port <<< "$ENTRY"
+    [ -z "$port" ] && port=22
+    
+    if ! command -v sshpass &> /dev/null; then
+        echo -e "\033[31mError: sshpass is required but not installed.\033[0m"
+        echo "Install with: brew install hudochenkov/sshpass/sshpass"
+        exit 1
+    fi
+    
+    echo -e "\033[36mConnecting to $alias ($user@$host:$port)...\033[0m"
+    sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -p "$port" "$user@$host"
+}
+
+# Main command parser
+case "$1" in
+    ssh)
+        case "$2" in
+            list)
+                if [ "$3" = "-a" ]; then
+                    list_aliases "-a"
+                else
+                    list_aliases "$3"
+                fi
+                ;;
+            add)
+                if [[ -z "$3" || -z "$4" || -z "$5" ]]; then
+                    show_help
+                    exit 1
+                fi
+                password="${*:6}"
+                # Separate port from password if it exists
+                port=$(echo "$password" | awk '{print $NF}' | grep -E '^[0-9]+$')
+                if [ -n "$port" ]; then
+                    password=${password%$port}
+                else
+                    port=22
+                fi
+                add_alias "$3" "$4" "$5" "$password" "$port"
+                ;;
+            remove)
+                remove_alias "$3"
+                ;;
+            help|"")
+                show_help
+                ;;
+            *)
+                connect_ssh "$2"
+                ;;
+        esac
+        ;;
+    *)
+        show_help
+        exit 1
+        ;;
+esac
