@@ -1,246 +1,505 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# sabid-ssh.sh - main CLI: manage quick ssh/scp via CSV store
+# macOS-compatible (no mapfile); supports multiple users per alias; robust password parsing.
+set -euo pipefail
 
-# Configuration
 CSV_DIR="$HOME/.ssh/quickssh"
 CSV_FILE="$CSV_DIR/servers.csv"
+SCP_HELPER="$CSV_DIR/quickscp.sh"
 
-# Initialize environment
 mkdir -p "$CSV_DIR"
 touch "$CSV_FILE"
 chmod 700 "$CSV_DIR"
 chmod 600 "$CSV_FILE"
+# Ensure header exists
+if ! grep -q '^alias_name,server_username,server_ip,password,port' "$CSV_FILE" 2>/dev/null; then
+  printf 'alias_name,server_username,server_ip,password,port\n' > "$CSV_FILE"
+fi
 
-# Create CSV headers if empty
-[ ! -s "$CSV_FILE" ] && echo "alias_name,server_username,server_ip,password,port" > "$CSV_FILE"
+# source scp helper if present (no failure if missing)
+if [ -f "$SCP_HELPER" ]; then
+  # shellcheck disable=SC1090
+  . "$SCP_HELPER"
+fi
 
-function show_help {
-    echo "Usage:"
-    echo "  sabid ssh list [-a]              - List aliases (-a shows passwords)"
-    echo "  sabid ssh list <alias>          - Show alias details"
-    echo "  sabid ssh <alias|hostname|ip>   - Connect to server"
-    echo "  sabid ssh add <alias> <user> <host> <pass> [port] - Add/update server"
-    echo "  sabid ssh remove <alias>        - Remove server"
-    echo "  sabid ssh help                  - Show this help"
-    echo ""
-    echo "Examples:"
-    echo "  sabid ssh add dashboard root dashboard.talentsprint.com 'password'"
-    echo "  sabid ssh dashboard.talentsprint.com"
-    echo "  sabid ssh 212.71.253.143"
-    echo "  sabid ssh dashboard"
+# ===== formatting helpers =====
+bold()  { printf "\033[1m%s\033[0m" "$1"; }
+cyan()  { printf "\033[36m%s\033[0m" "$1"; }
+yellow(){ printf "\033[33m%s\033[0m" "$1"; }
+red()   { printf "\033[31m%s\033[0m" "$1"; }
+
+need_sshpass() {
+  if ! command -v sshpass >/dev/null 2>&1; then
+    echo -e "$(red 'Error: sshpass is required but not installed.')"
+    echo "macOS: brew install hudochenkov/sshpass/sshpass"
+    echo "Debian/Ubuntu: sudo apt-get install sshpass"
+    exit 1
+  fi
 }
 
-function list_aliases {
-    if [ "$1" = "-a" ]; then
-        echo -e "\n\033[1mAvailable aliases (with passwords):\033[0m\n"
-        awk -F',' 'NR > 1 {
-            port = ($5 == "") ? "22" : $5;
-            printf "  \033[36m%-15s\033[0m\t→\t\033[33m%s@%s:%s\033[0m\t[\033[31m%s\033[0m]\n", $1, $2, $3, port, $4
-        }' "$CSV_FILE"
-    elif [ -z "$1" ]; then
-        echo -e "\n\033[1mAvailable aliases:\033[0m\n"
-        awk -F',' 'NR > 1 {
-            port = ($5 == "") ? "22" : $5;
-            printf "  \033[36m%-15s\033[0m\t→\t\033[33m%s@%s:%s\033[0m\n", $1, $2, $3, port
-        }' "$CSV_FILE"
-    else
-        ENTRY=$(grep "^$1," "$CSV_FILE")
-        if [ -z "$ENTRY" ]; then
-            echo -e "\033[31mAlias '$1' not found.\033[0m"
-            exit 1
-        fi
-        IFS=',' read -r alias user host pass port <<< "$ENTRY"
+resolve_ip() {
+  local host="$1"
+  if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf '%s' "$host"
+    return 0
+  fi
+  local ip
+  ip="$(dig +short "$host" A 2>/dev/null | head -1 || true)"
+  if [ -z "$ip" ]; then
+    local cname
+    cname="$(dig +short "$host" CNAME 2>/dev/null | head -1 || true)"
+    if [ -n "$cname" ]; then
+      ip="$(dig +short "$cname" A 2>/dev/null | head -1 || true)"
+    fi
+  fi
+  printf '%s' "$ip"
+}
+
+# ===== CSV helpers =====
+csv_get_entry_by_alias() {
+  local alias="$1"
+  grep -E "^${alias}," "$CSV_FILE" | head -1 || true
+}
+
+csv_get_entry_by_alias_and_user() {
+  local alias="$1"
+  local user="$2"
+  if [ -z "$alias" ] || [ -z "$user" ]; then
+    return 0
+  fi
+  grep -E "^${alias},${user}," "$CSV_FILE" | head -1 || true
+}
+
+csv_add_or_replace() {
+  # Replace any existing alias+user record; otherwise append
+  local alias="$1" user="$2" host="$3" pass="$4" port="$5"
+  local tmp body out
+  tmp="$(mktemp)"
+  body="${tmp}.body"; out="${tmp}.out"
+
+  # Extract body (skip header)
+  tail -n +2 "$CSV_FILE" > "$body" || true
+
+  # Build new body: keep lines that don't match alias+user
+  awk -F',' -v a="$alias" -v u="$user" '{
+    if ($1==a && $2==u) next;
+    print
+  }' "$body" > "$out" || true
+
+  # Append new record
+  printf '%s,%s,%s,%s,%s\n' "$alias" "$user" "$host" "$pass" "$port" >> "$out"
+
+  # Write header + out -> CSV_FILE
+  {
+    echo "alias_name,server_username,server_ip,password,port"
+    cat "$out"
+  } > "$tmp"
+
+  mv "$tmp" "$CSV_FILE"
+  chmod 600 "$CSV_FILE"
+  rm -f "$body" "$out" 2>/dev/null || true
+}
+
+csv_remove_alias_and_secondary() {
+  local alias="$1"
+  local entry host ip tmp
+  entry="$(csv_get_entry_by_alias "$alias")"
+  if [ -z "$entry" ]; then
+    echo "Alias '$alias' not found."
+    exit 1
+  fi
+  IFS=',' read -r _a _u host _p _pt <<< "$entry"
+
+  tmp="$(mktemp)"
+  # Remove all records with this alias (all users)
+  awk -F',' -v a="$alias" 'NR==1 || $1!=a { print }' "$CSV_FILE" > "$tmp"
+
+  # Remove secondary IP alias if present
+  if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    ip="$host"
+  else
+    ip="$(resolve_ip "$host")"
+  fi
+  if [ -n "$ip" ]; then
+    awk -F',' -v ip="$ip" 'NR==1 || $1!=ip { print }' "$tmp" > "${tmp}.2" || true
+    mv "${tmp}.2" "$tmp"
+  fi
+
+  mv "$tmp" "$CSV_FILE"
+  chmod 600 "$CSV_FILE"
+  echo "Removed alias '$alias' and related records."
+}
+
+# ===== UI & behavior helpers =====
+show_help() {
+  cat <<'EOF'
+Usage:
+  sabid ssh list [-a]                 - List aliases (-a shows passwords)
+  sabid ssh list <alias>              - Show alias details
+  sabid ssh <alias|hostname|ip> [username] [--port N] - Connect to server
+                                      If username positional given, use it; otherwise use stored user or root.
+  sabid ssh add <alias> <user> <host> <pass> [port]    - Add/update server (supports multiple users per alias)
+  sabid ssh remove <alias>|--all      - Remove server or wipe all records
+  sabid scp [--user USER] [--port N] <alias|host|ip> <SRC> <DST>
+                                      - Copy files (upload/download). If USER not given, uses saved user or root.
+
+Notes:
+- When an alias has multiple records (different users), you'll be prompted to choose which user to use.
+- Passwords may include spaces or special characters; quote them when calling `add`.
+EOF
+}
+
+list_aliases() {
+  if [ "${1:-}" = "-a" ]; then
+    echo -e "\n$(bold 'Available aliases (with passwords):')\n"
+    awk -F',' 'NR > 1 { port = ($5 == "") ? "22" : $5; printf "  \033[36m%-15s\033[0m\t→\t\033[33m%s@%s:%s\033[0m\t[\033[31m%s\033[0m]\n", $1, $2, $3, port, $4 }' "$CSV_FILE"
+  elif [ -z "${1:-}" ]; then
+    echo -e "\n$(bold 'Available aliases:')\n"
+    awk -F',' 'NR > 1 { port = ($5 == "") ? "22" : $5; printf "  \033[36m%-15s\033[0m\t→\t\033[33m%s@%s:%s\033[0m\n", $1, $2, $3, port }' "$CSV_FILE"
+  else
+    local found=0 line
+    while IFS= read -r line || [ -n "$line" ]; do
+      if echo "$line" | grep -E "^${1}," >/dev/null 2>&1; then
+        found=1
+        IFS=',' read -r alias user host pass port <<< "$line"
         [ -z "$port" ] && port=22
-        echo -e "\n\033[1mServer Details:\033[0m"
-        echo -e "  \033[36mAlias:\033[0m\t$alias"
-        echo -e "  \033[36mUser:\033[0m\t\t$user"
-        echo -e "  \033[36mHost:\033[0m\t\t$host"
-        echo -e "  \033[36mPort:\033[0m\t\t$port"
-        echo -e "  \033[36mPassword:\033[0m\t$pass\n"
+        echo -e "\n$(bold "Server Details for $alias ($user)")"
+        echo -e "  $(cyan 'Alias:')\t$alias"
+        echo -e "  $(cyan 'User:')\t\t$user"
+        echo -e "  $(cyan 'Host:')\t\t$host"
+        echo -e "  $(cyan 'Port:')\t\t$port"
+        echo -e "  $(cyan 'Password:')\t$pass\n"
+      fi
+    done < "$CSV_FILE"
+    if [ "$found" -eq 0 ]; then
+      echo -e "$(red "Alias '$1' not found.")"
+      exit 1
     fi
+  fi
 }
 
-function add_alias {
-    if [[ -z "$1" || -z "$2" || -z "$3" || -z "$4" ]]; then
-        echo "Usage: sabid ssh add <alias> <user> <host> <pass> [port]"
-        exit 1
-    fi
+add_alias() {
+  if [[ -z "${1:-}" || -z "${2:-}" || -z "${3:-}" || -z "${4:-}" ]]; then
+    echo "Usage: sabid ssh add <alias> <user> <host> <pass> [port]"
+    exit 1
+  fi
+  local alias="$1" user="$2" host="$3" pass="$4" port="${5:-22}"
 
-    local alias="$1"
-    local user="$2"
-    local host="$3"
-    local pass="$4"
-    local port="${5:-22}"
+  # store/replace by alias+user so multiple users allowed for same alias
+  csv_add_or_replace "$alias" "$user" "$host" "$pass" "$port"
 
-    # Create primary record with original alias
-    add_single_record "$alias" "$user" "$host" "$pass" "$port"
+  # add ip alias record (same user)
+  local ip
+  ip="$(resolve_ip "$host")"
+  if [ -n "$ip" ]; then
+    csv_add_or_replace "$ip" "$user" "$host" "$pass" "$port"
+    echo "Added records:"
+    echo "  - $alias → $user@$host:$port"
+    echo "  - $ip    → $user@$host:$port"
+  else
+    echo "Added record:"
+    echo "  - $alias → $user@$host:$port"
+    echo "Warning: Could not resolve IP for $host"
+  fi
+}
 
-    # Create secondary record
-    if [[ $host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        # If host is IP, use IP as secondary alias
-        add_single_record "$host" "$user" "$host" "$pass" "$port"
-        echo "Added records:"
-        echo "  - $alias → $user@$host:$port"
-        echo "  - $host → $user@$host:$port"
+prompt_new_password() {
+  local prompt="${1:-Enter password: }" pw1 pw2
+  while true; do
+    read -rs -p "$prompt" pw1; echo
+    read -rs -p "Confirm password: " pw2; echo
+    if [ "$pw1" = "$pw2" ]; then
+      printf '%s' "$pw1"
+      return 0
     else
-        # If host is hostname, use resolved IP as secondary alias
-        ip=$(dig +short "$host" | head -1)
-        if [ -n "$ip" ]; then
-            add_single_record "$ip" "$user" "$host" "$pass" "$port"
-            echo "Added records:"
-            echo "  - $alias → $user@$host:$port"
-            echo "  - $ip → $user@$host:$port"
-        else
-            echo "Added record:"
-            echo "  - $alias → $user@$host:$port"
-            echo "Warning: Could not resolve IP for $host"
+      echo -e "$(red 'Passwords do not match. Try again.')"
+    fi
+  done
+}
+
+# select from multiple records (optional preferred user)
+select_entry_from_matches() {
+  # select_entry_from_matches <alias> [preferred_user]
+  local alias="$1" preferred_user="${2:-}"
+  local lines=() line
+
+  # try exact alias+user first when preferred provided
+  if [ -n "$preferred_user" ]; then
+    line="$(csv_get_entry_by_alias_and_user "$alias" "$preferred_user" || true)"
+    if [ -n "$line" ]; then
+      printf '%s' "$line"
+      return 0
+    fi
+  fi
+
+  # collect alias matches
+  while IFS= read -r line || [ -n "$line" ]; do
+    if echo "$line" | grep -E "^${alias}," >/dev/null 2>&1; then
+      lines+=("$line")
+    fi
+  done < "$CSV_FILE"
+
+  # if none found, try IP alias
+  if [ "${#lines[@]}" -eq 0 ]; then
+    local ip
+    ip="$(resolve_ip "$alias")"
+    if [ -n "$ip" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        if echo "$line" | grep -E "^${ip}," >/dev/null 2>&1; then
+          lines+=("$line")
         fi
+      done < "$CSV_FILE"
     fi
+  fi
+
+  local count=${#lines[@]}
+  if [ "$count" -eq 0 ]; then
+    echo ""
+    return 0
+  elif [ "$count" -eq 1 ]; then
+    printf '%s' "${lines[0]}"
+    return 0
+  else
+    echo "Multiple records found for '$alias':"
+    local i=0 l a u h p pt
+    for l in "${lines[@]}"; do
+      i=$((i+1))
+      IFS=',' read -r a u h p pt <<< "$l"
+      [ -z "$pt" ] && pt=22
+      printf "  %d) %s@%s:%s (alias: %s)\n" "$i" "$u" "$h" "$pt" "$a"
+    done
+    while true; do
+      read -p "Choose entry [1-$count]: " sel
+      if echo "$sel" | grep -E '^[0-9]+$' >/dev/null 2>&1 && [ "$sel" -ge 1 ] && [ "$sel" -le "$count" ]; then
+        idx=$((sel-1))
+        printf '%s' "${lines[$idx]}"
+        return 0
+      else
+        echo "Invalid selection."
+      fi
+    done
+  fi
 }
 
-function add_single_record {
-    local alias="$1"
-    local user="$2"
-    local host="$3"
-    local pass="$4"
-    local port="$5"
+# Merge: prefer alias+user when provided; interactive selection otherwise
+merge_effective_auth() {
+  # args: target, override_user, override_port
+  local in="$1" over_user="${2:-}" over_port="${3:-}"
+  local entry ip alias user host pass port
 
-    TMP=$(mktemp)
-    grep -v "^$alias," "$CSV_FILE" > "$TMP"
-    printf '%s,%s,%s,%s,%s\n' "$alias" "$user" "$host" "$pass" "$port" >> "$TMP"
-    mv "$TMP" "$CSV_FILE"
-    chmod 600 "$CSV_FILE"
-}
-
-function remove_alias {
-    if [ -z "$1" ]; then
-        echo "Usage: sabid ssh remove <alias>"
-        exit 1
+  if [ -n "$over_user" ]; then
+    entry="$(csv_get_entry_by_alias_and_user "$in" "$over_user" || true)"
+    if [ -n "$entry" ]; then
+      IFS=',' read -r alias user host pass port <<< "$entry"
     fi
+  fi
 
-    # Find the host associated with this alias
-    ENTRY=$(grep "^$1," "$CSV_FILE")
-    if [ -z "$ENTRY" ]; then
-        echo "Alias '$1' not found."
-        exit 1
-    fi
-
-    IFS=',' read -r alias user host pass port <<< "$ENTRY"
-    
-    # Remove both the alias and its secondary record
-    TMP=$(mktemp)
-    grep -v "^$1," "$CSV_FILE" > "$TMP"
-    
-    # Remove IP record if exists
-    if [[ $host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        # Remove record with IP as alias
-        grep -v "^$host," "$TMP" > "${TMP}.2" && mv "${TMP}.2" "$TMP"
+  if [ -z "${alias:-}" ]; then
+    entry="$(select_entry_from_matches "$in" "$over_user" || true)"
+    if [ -n "$entry" ]; then
+      IFS=',' read -r alias user host pass port <<< "$entry"
     else
-        # Remove record with resolved IP as alias
-        ip=$(dig +short "$host" | head -1)
-        [ -n "$ip" ] && grep -v "^$ip," "$TMP" > "${TMP}.2" && mv "${TMP}.2" "$TMP"
+      entry="$(csv_get_entry_by_alias "$in" || true)"
+      if [ -n "$entry" ]; then
+        IFS=',' read -r alias user host pass port <<< "$entry"
+      fi
     fi
-    
-    mv "$TMP" "$CSV_FILE"
-    chmod 600 "$CSV_FILE"
-    echo "Removed alias '$1' and related records"
+  fi
+
+  if [ -z "${alias:-}" ]; then
+    ip="$(resolve_ip "$in")"
+    if [ -n "$ip" ]; then
+      entry="$(csv_get_entry_by_alias "$ip" || true)"
+      if [ -n "$entry" ]; then
+        IFS=',' read -r alias user host pass port <<< "$entry"
+      fi
+    fi
+  fi
+
+  if [ -z "${alias:-}" ]; then
+    host="$in"
+    ip="$(resolve_ip "$in")"
+    alias="${ip:-$in}"
+    user="root"
+    pass=""
+    port=22
+  fi
+
+  [ -n "$over_user" ] && user="$over_user"
+  [ -n "$over_port" ] && port="$over_port"
+
+  printf '%s,%s,%s,%s,%s\n' "$alias" "$user" "$host" "$pass" "$port"
 }
 
-function connect_ssh {
-    # Check if argument is an existing alias
-    ENTRY=$(grep "^$1," "$CSV_FILE")
-    
-    if [ -z "$ENTRY" ]; then
-        # If not a direct alias, try resolving hostname to IP
-        if [[ ! "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            resolved_host=$(dig +short "$1" | head -1)
-            
-            # If we got a CNAME (non-IP result), resolve it further
-            if [ -n "$resolved_host" ] && [[ ! "$resolved_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                resolved_ip=$(dig +short "$resolved_host" | head -1)
-                if [ -n "$resolved_ip" ]; then
-                    # Check if resolved IP exists as an alias
-                    ENTRY=$(grep "^$resolved_ip," "$CSV_FILE")
-                    if [ -z "$ENTRY" ]; then
-                        echo -e "\033[31mNo alias found for '$1' or its resolved host ($resolved_host → $resolved_ip)\033[0m"
-                        exit 1
-                    fi
-                else
-                    echo -e "\033[31mNo alias found for '$1' or its resolved host ($resolved_host)\033[0m"
-                    exit 1
-                fi
-            elif [ -n "$resolved_host" ]; then
-                # We got an IP directly
-                ENTRY=$(grep "^$resolved_host," "$CSV_FILE")
-                if [ -z "$ENTRY" ]; then
-                    echo -e "\033[31mNo alias found for '$1' or its IP ($resolved_host)\033[0m"
-                    exit 1
-                fi
-            else
-                echo -e "\033[31mCould not resolve '$1' to any IP address\033[0m"
-                exit 1
-            fi
-        else
-            # Check if IP exists as an alias
-            ENTRY=$(grep "^$1," "$CSV_FILE")
-            if [ -z "$ENTRY" ]; then
-                echo -e "\033[31mNo alias found for '$1'\033[0m"
-                exit 1
-            fi
-        fi
-    fi
-
-    IFS=',' read -r alias user host pass port <<< "$ENTRY"
-    [ -z "$port" ] && port=22
-    
-    if ! command -v sshpass &> /dev/null; then
-        echo -e "\033[31mError: sshpass is required but not installed.\033[0m"
-        echo "Install with: brew install hudochenkov/sshpass/sshpass"
-        exit 1
-    fi
-    
-    echo -e "\033[36mConnecting to $alias ($user@$host:$port)...\033[0m"
-    sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -p "$port" "$user@$host"
+attempt_ssh_once() {
+  local user="$1" host="$2" pass="$3" port="$4"
+  SSHPASS="$pass" sshpass -e ssh \
+    -o StrictHostKeyChecking=no \
+    -o PreferredAuthentications=password \
+    -o PubkeyAuthentication=no \
+    -p "$port" \
+    "$user@$host"
 }
 
-# Main command parser
-case "$1" in
+handle_bad_password_update() {
+  local alias="$1" user="$2" host="$3" port="$4"
+  echo -e "$(red 'Authentication failed.')"
+  local newpass ip
+  newpass="$(prompt_new_password 'Update password: ')"
+
+  if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    ip="$host"
+  else
+    ip="$(resolve_ip "$host")"
+  fi
+
+  csv_add_or_replace "$alias" "$user" "$host" "$newpass" "$port"
+  if [ -n "$ip" ]; then
+    csv_add_or_replace "$ip" "$user" "$host" "$newpass" "$port"
+  fi
+  echo "Password updated for '$alias' (user $user)."
+  printf '%s' "$newpass"
+}
+
+# Connect: supports positional username (second positional arg)
+connect_ssh() {
+  need_sshpass
+
+  # arguments: target [positional_user] [--port N] or flags in any order after user
+  if [ $# -lt 1 ]; then
+    echo -e "$(red 'Missing target.')"; show_help; exit 1
+  fi
+
+  local target pos_user port_override
+  target="$1"; shift || true
+
+  if [ $# -ge 1 ] && [[ ! "$1" =~ ^- ]]; then
+    pos_user="$1"; shift || true
+  else
+    pos_user=""
+  fi
+
+  # remaining flags
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port) port_override="$2"; shift 2 ;;
+      --user) pos_user="$2"; shift 2 ;;
+      --help|-h|--h) show_help; exit 0 ;;
+      --) shift; break ;;
+      *) echo "Unknown option: $1"; show_help; exit 1 ;;
+    esac
+  done
+
+  local merged alias user host pass port
+  merged="$(merge_effective_auth "$target" "${pos_user:-}" "${port_override:-}")"
+  IFS=',' read -r alias user host pass port <<< "$merged"
+  [ -z "$user" ] && user="root"
+  [ -z "$port" ] && port=22
+
+  echo -e "$(cyan "Connecting to $alias ($user@$host:$port)...")"
+  set +e
+  attempt_ssh_once "$user" "$host" "$pass" "$port"
+  rc="$?"
+  set -e
+
+  if [ "$rc" -ne 0 ]; then
+    newpass="$(handle_bad_password_update "$alias" "$user" "$host" "$port")"
+    echo -e "$(yellow 'Retrying with updated password...')"
+    SSHPASS="$newpass" sshpass -e ssh \
+      -o StrictHostKeyChecking=no \
+      -o PreferredAuthentications=password \
+      -o PubkeyAuthentication=no \
+      -p "$port" \
+      "$user@$host"
+  fi
+}
+
+# scp wrapper (calls quickscp from quickscp.sh)
+cmd_scp() {
+  if ! declare -F quickscp >/dev/null 2>&1; then
+    echo -e "$(red 'SCP helper not found. Create ~/.ssh/quickssh/quickscp.sh (provided).')"
+    exit 1
+  fi
+
+  local user_override="" port_override="" args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user) user_override="$2"; shift 2 ;;
+      --port) port_override="$2"; shift 2 ;;
+      --help|-h|--h) show_help; exit 0 ;;
+      *) args+=( "$1" ); shift ;;
+    esac
+  done
+
+  if [ "${#args[@]}" -lt 3 ]; then
+    echo "Usage: sabid scp [--user USER] [--port N] <alias|host|ip> <SRC> <DST>"
+    exit 1
+  fi
+
+  local target="${args[0]}" src="${args[1]}" dst="${args[2]}"
+  local merged alias user host pass port
+  merged="$(merge_effective_auth "$target" "$user_override" "$port_override")"
+  IFS=',' read -r alias user host pass port <<< "$merged"
+  [ -z "$user" ] && user="root"
+  [ -z "$port" ] && port=22
+
+  quickscp "$CSV_FILE" "$alias" "$user" "$host" "$pass" "$port" "$src" "$dst"
+}
+
+# dispatcher
+main() {
+  if [ $# -eq 0 ]; then show_help; exit 0; fi
+
+  case "$1" in
+    help|--help|-h) show_help; exit 0 ;;
     ssh)
-        case "$2" in
-            list)
-                if [ "$3" = "-a" ]; then
-                    list_aliases "-a"
-                else
-                    list_aliases "$3"
-                fi
-                ;;
-            add)
-                if [[ -z "$3" || -z "$4" || -z "$5" ]]; then
-                    show_help
-                    exit 1
-                fi
-                password="${*:6}"
-                # Separate port from password if it exists
-                port=$(echo "$password" | awk '{print $NF}' | grep -E '^[0-9]+$')
-                if [ -n "$port" ]; then
-                    password=${password%$port}
-                else
-                    port=22
-                fi
-                add_alias "$3" "$4" "$5" "$password" "$port"
-                ;;
-            remove)
-                remove_alias "$3"
-                ;;
-            help|"")
-                show_help
-                ;;
-            *)
-                connect_ssh "$2"
-                ;;
-        esac
-        ;;
-    *)
-        show_help
-        exit 1
-        ;;
-esac
+      if [ "${2:-}" = "help" ] || [ "${2:-}" = "--help" ] || [ "${2:-}" = "-h" ]; then show_help; exit 0; fi
+      case "${2:-}" in
+        list) list_aliases "${3:-}" ;;
+        add)
+          # robust add parser: sabid ssh add alias user host pass [port]
+          if [[ -z "${3:-}" || -z "${4:-}" || -z "${5:-}" ]]; then show_help; exit 1; fi
+          local alias_arg="$3" user_arg="$4" host_arg="$5"
+          # gather rest args (password may contain spaces/special chars)
+          shift 5
+          local arr=()
+          while [ $# -gt 0 ]; do arr+=( "$1" ); shift; done
+          local port_arg="22" pass_arg=""
+          if [ "${#arr[@]}" -gt 0 ]; then
+            # if last element is an integer -> port
+            local last="${arr[$(( ${#arr[@]} - 1 ))]}"
+            if echo "$last" | grep -E '^[0-9]+$' >/dev/null 2>&1; then
+              port_arg="$last"
+              unset 'arr[$(( ${#arr[@]} - 1 ))]'
+            fi
+            if [ "${#arr[@]}" -gt 0 ]; then
+              pass_arg="${arr[0]}"
+              # join if multiple
+              for ((i=1;i<${#arr[@]};i++)); do pass_arg="${pass_arg} ${arr[i]}"; done
+            fi
+          fi
+          add_alias "$alias_arg" "$user_arg" "$host_arg" "$pass_arg" "$port_arg"
+          ;;
+        remove)
+          if [ "${3:-}" = "--all" ]; then
+            read -p "⚠️  This will remove ALL saved servers. Continue? (y/N): " ans
+            case "$ans" in y|Y) echo "alias_name,server_username,server_ip,password,port" > "$CSV_FILE"; chmod 600 "$CSV_FILE"; echo "All records removed." ;; *) echo "Aborted." ;; esac
+          else
+            [ -n "${3:-}" ] || { echo "Usage: sabid ssh remove <alias>|--all"; exit 1; }
+            csv_remove_alias_and_secondary "$3"
+          fi
+          ;;
+        "") show_help; exit 0 ;;
+        *)
+          # shift 'ssh' and pass remaining args to connect_ssh (positional username supported)
+          shift
+          connect_ssh "$@"
+          ;;
+      esac
+      ;;
+    scp) shift; cmd_scp "$@" ;;
+    *) show_help; exit 0 ;;
+  esac
+}
+
+main "$@"
